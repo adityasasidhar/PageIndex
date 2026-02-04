@@ -7,9 +7,92 @@ import re
 from .utils import *
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pydantic import BaseModel, Field, ValidationError
+from typing import Literal, Type, TypeVar, Optional, Union, List
 
+T = TypeVar("T", bound=BaseModel)
+
+def parse_llm_response(model_cls: Type[T], raw_response: str, logger=None) -> T | None:
+    """
+    Parse and validate LLM JSON output using Pydantic.
+    Returns None if validation fails.
+    """
+    try:
+        data = extract_json(raw_response)
+
+        # normalize common LLM inconsistencies
+        for k, v in data.items():
+            if isinstance(v, str):
+                data[k] = v.strip().lower()
+
+        return model_cls(**data)
+
+    except (ValidationError, ValueError, TypeError) as e:
+        if logger:
+            logger.error(
+                f"LLM response validation failed for {model_cls.__name__}: {e}"
+            )
+        return None
 
 ################### check title in page #########################################################
+class CheckTitleAppearanceResponse(BaseModel):
+    thinking: str = Field(..., min_length=1)
+    answer: Literal["yes", "no"]
+
+class CheckTitleAppearanceInStartResponse(BaseModel):
+    thinking: str = Field(..., min_length=1)
+    start_begin: Literal["yes", "no"]
+
+class TocDetectorResponse(BaseModel):
+    thinking: str = Field(..., min_length=1)
+    toc_detected: Literal["yes", "no"]
+
+class TocCompletionResponse(BaseModel):
+    thinking: str = Field(..., min_length=1)
+    completed: Literal["yes", "no"]
+
+class PageIndexDetectionResponse(BaseModel):
+    thinking: str = Field(..., min_length=1)
+    page_index_given_in_toc: Literal["yes", "no"]
+
+class TocIndexItem(BaseModel):
+    structure: Optional[str] = None
+    title: str
+    physical_index: str
+
+class TocIndexResponse(BaseModel):
+    root: List[TocIndexItem]
+
+class TocTransformerItem(BaseModel):
+    structure: Optional[str] = None
+    title: str
+    page: Union[str, int, None] = None
+
+class TocTransformerResponse(BaseModel):
+    table_of_contents: List[TocTransformerItem]
+
+class AddPageNumberItem(BaseModel):
+    structure: Optional[str] = None
+    title: str
+    start: Literal["yes", "no"]
+    physical_index: Optional[str] = None
+
+class AddPageNumberResponse(BaseModel):
+    root: List[AddPageNumberItem]
+
+class SingleTocFixerResponse(BaseModel):
+    thinking: str = Field(..., min_length=1)
+    physical_index: str
+
+class GenerateTocItem(BaseModel):
+    structure: Optional[str] = None
+    title: str
+    physical_index: str
+
+class GenerateTocResponse(BaseModel):
+    root: List[GenerateTocItem]
+
+
 async def check_title_appearance(item, page_list, start_index=1, model=None):    
     title=item['title']
     if 'physical_index' not in item or item['physical_index'] is None:
@@ -37,15 +120,15 @@ async def check_title_appearance(item, page_list, start_index=1, model=None):
     Directly return the final JSON structure. Do not output anything else."""
 
     response = await ChatGPT_API_async(model=model, prompt=prompt)
-    response = extract_json(response)
-    if 'answer' in response:
-        answer = response['answer']
+    parsed_response = parse_llm_response(CheckTitleAppearanceResponse, response)
+    
+    if parsed_response:
+        answer = parsed_response.answer
     else:
         answer = 'no'
     return {'list_index': item['list_index'], 'answer': answer, 'title': title, 'page_number': page_number}
 
-
-async def check_title_appearance_in_start(title, page_text, model=None, logger=None):    
+async def check_title_appearance_in_start(title, page_text, model=None, logger=None):
     prompt = f"""
     You will be given the current section title and the current page_text.
     Your job is to check if the current section starts in the beginning of the given page_text.
@@ -65,11 +148,10 @@ async def check_title_appearance_in_start(title, page_text, model=None, logger=N
     Directly return the final JSON structure. Do not output anything else."""
 
     response = await ChatGPT_API_async(model=model, prompt=prompt)
-    response = extract_json(response)
+    parsed_response = parse_llm_response(CheckTitleAppearanceInStartResponse, response, logger)
     if logger:
         logger.info(f"Response: {response}")
-    return response.get("start_begin", "no")
-
+    return parsed_response.start_begin if parsed_response else "no"
 
 async def check_title_appearance_in_start_concurrent(structure, page_list, model=None, logger=None):
     if logger:
@@ -100,7 +182,7 @@ async def check_title_appearance_in_start_concurrent(structure, page_list, model
 
     return structure
 
-
+   
 def toc_detector_single_page(content, model=None):
     prompt = f"""
     Your job is to detect if there is a table of content provided in the given text.
@@ -117,9 +199,8 @@ def toc_detector_single_page(content, model=None):
     Please note: abstract,summary, notation list, figure list, table list, etc. are not table of contents."""
 
     response = ChatGPT_API(model=model, prompt=prompt)
-    # print('response', response)
-    json_content = extract_json(response)    
-    return json_content['toc_detected']
+    parsed_response = parse_llm_response(TocDetectorResponse, response)
+    return parsed_response.toc_detected if parsed_response else "no" 
 
 
 def check_if_toc_extraction_is_complete(content, toc, model=None):
@@ -136,8 +217,8 @@ def check_if_toc_extraction_is_complete(content, toc, model=None):
 
     prompt = prompt + '\n Document:\n' + content + '\n Table of contents:\n' + toc
     response = ChatGPT_API(model=model, prompt=prompt)
-    json_content = extract_json(response)
-    return json_content['completed']
+    parsed_response = parse_llm_response(TocCompletionResponse, response)
+    return parsed_response.completed if parsed_response else "no"
 
 
 def check_if_toc_transformation_is_complete(content, toc, model=None):
@@ -154,8 +235,8 @@ def check_if_toc_transformation_is_complete(content, toc, model=None):
 
     prompt = prompt + '\n Raw Table of contents:\n' + content + '\n Cleaned Table of contents:\n' + toc
     response = ChatGPT_API(model=model, prompt=prompt)
-    json_content = extract_json(response)
-    return json_content['completed']
+    parsed_response = parse_llm_response(TocCompletionResponse, response)
+    return parsed_response.completed if parsed_response else "no"
 
 def extract_toc_content(content, model=None):
     prompt = f"""
@@ -213,8 +294,8 @@ def detect_page_index(toc_content, model=None):
     Directly return the final JSON structure. Do not output anything else."""
 
     response = ChatGPT_API(model=model, prompt=prompt)
-    json_content = extract_json(response)
-    return json_content['page_index_given_in_toc']
+    parsed_response = parse_llm_response(PageIndexDetectionResponse, response)
+    return parsed_response.page_index_given_in_toc if parsed_response else "no"
 
 def toc_extractor(page_list, toc_page_list, model):
     def transform_dots_to_colon(text):
@@ -262,8 +343,18 @@ def toc_index_extractor(toc, content, model=None):
 
     prompt = tob_extractor_prompt + '\nTable of contents:\n' + str(toc) + '\nDocument pages:\n' + content
     response = ChatGPT_API(model=model, prompt=prompt)
-    json_content = extract_json(response)    
-    return json_content
+    
+    data = extract_json(response)
+    if isinstance(data, list):
+        data = {'root': data}
+    
+    try:
+        parsed_response = TocIndexResponse(**data)
+        # Convert back to list of dicts as expected by downstream code
+        return [item.model_dump() for item in parsed_response.root]
+    except ValidationError as e:
+        print(f"Validation failed for toc_index_extractor: {e}")
+        return []
 
 
 
@@ -292,9 +383,12 @@ def toc_transformer(toc_content, model=None):
     last_complete, finish_reason = ChatGPT_API_with_finish_reason(model=model, prompt=prompt)
     if_complete = check_if_toc_transformation_is_complete(toc_content, last_complete, model)
     if if_complete == "yes" and finish_reason == "finished":
-        last_complete = extract_json(last_complete)
-        cleaned_response=convert_page_to_int(last_complete['table_of_contents'])
-        return cleaned_response
+        parsed_response = parse_llm_response(TocTransformerResponse, last_complete)
+        if parsed_response:
+            # Normalize to list of dicts for convert_page_to_int
+            data_list = [item.model_dump() for item in parsed_response.table_of_contents]
+            return convert_page_to_int(data_list)
+        return []
     
     last_complete = get_json_content(last_complete)
     while not (if_complete == "yes" and finish_reason == "finished"):
@@ -322,10 +416,16 @@ def toc_transformer(toc_content, model=None):
         if_complete = check_if_toc_transformation_is_complete(toc_content, last_complete, model)
         
 
-    last_complete = json.loads(last_complete)
-
-    cleaned_response=convert_page_to_int(last_complete['table_of_contents'])
-    return cleaned_response
+    try:
+        data = extract_json(last_complete)
+        # Ensure data matches model structure
+        parsed_response = TocTransformerResponse(**data)
+        data_list = [item.model_dump() for item in parsed_response.table_of_contents]
+        cleaned_response=convert_page_to_int(data_list)
+        return cleaned_response
+    except ValidationError as e:
+        print(f"Validation failed for toc_transformer: {e}")
+        return []
     
 
 
@@ -475,7 +575,18 @@ def add_page_number_to_toc(part, structure, model=None):
 
     prompt = fill_prompt_seq + f"\n\nCurrent Partial Document:\n{part}\n\nGiven Structure\n{json.dumps(structure, indent=2)}\n"
     current_json_raw = ChatGPT_API(model=model, prompt=prompt)
-    json_result = extract_json(current_json_raw)
+    
+    # Wrap list in root object for validation
+    data = extract_json(current_json_raw)
+    if isinstance(data, list):
+        data = {'root': data}
+        
+    try:
+        parsed_response = AddPageNumberResponse(**data)
+        json_result = [item.model_dump() for item in parsed_response.root]
+    except ValidationError as e:
+        print(f"Validation failed for add_page_number_to_toc: {e}")
+        json_result = []
     
     for item in json_result:
         if 'start' in item:
@@ -526,7 +637,15 @@ def generate_toc_continue(toc_content, part, model="gpt-4o-2024-11-20"):
     prompt = prompt + '\nGiven text\n:' + part + '\nPrevious tree structure\n:' + json.dumps(toc_content, indent=2)
     response, finish_reason = ChatGPT_API_with_finish_reason(model=model, prompt=prompt)
     if finish_reason == 'finished':
-        return extract_json(response)
+        data = extract_json(response)
+        if isinstance(data, list):
+            data = {'root': data}
+        try:
+            parsed_response = GenerateTocResponse(**data)
+            return [item.model_dump() for item in parsed_response.root]
+        except ValidationError as e:
+            print(f"Validation failed for generate_toc_continue: {e}")
+            return []
     else:
         raise Exception(f'finish reason: {finish_reason}')
     
@@ -561,7 +680,15 @@ def generate_toc_init(part, model=None):
     response, finish_reason = ChatGPT_API_with_finish_reason(model=model, prompt=prompt)
 
     if finish_reason == 'finished':
-         return extract_json(response)
+        data = extract_json(response)
+        if isinstance(data, list):
+            data = {'root': data}
+        try:
+            parsed_response = GenerateTocResponse(**data)
+            return [item.model_dump() for item in parsed_response.root]
+        except ValidationError as e:
+            print(f"Validation failed for generate_toc_init: {e}")
+            return []
     else:
         raise Exception(f'finish reason: {finish_reason}')
 
@@ -744,8 +871,8 @@ def single_toc_item_index_fixer(section_title, content, model="gpt-4o-2024-11-20
 
     prompt = tob_extractor_prompt + '\nSection Title:\n' + str(section_title) + '\nDocument pages:\n' + content
     response = ChatGPT_API(model=model, prompt=prompt)
-    json_content = extract_json(response)    
-    return convert_physical_index_to_int(json_content['physical_index'])
+    parsed_response = parse_llm_response(SingleTocFixerResponse, response)
+    return convert_physical_index_to_int(parsed_response.physical_index) if parsed_response else None
 
 
 
