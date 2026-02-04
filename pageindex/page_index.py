@@ -272,7 +272,7 @@ def extract_toc_content(content, model=None):
         if_complete = check_if_toc_transformation_is_complete(content, response, model)
         
         # Optional: Add a maximum retry limit to prevent infinite loops
-        if len(chat_history) > 5:  # Arbitrary limit of 10 attempts
+        if len(chat_history) > 10:  # Arbitrary limit of 10 attempts
             raise Exception('Failed to complete table of contents after maximum retries')
     
     return response
@@ -320,7 +320,7 @@ def toc_extractor(page_list, toc_page_list, model):
 
 def toc_index_extractor(toc, content, model=None):
     print('start toc_index_extractor')
-    tob_extractor_prompt = """
+    toc_extractor_prompt = """
     You are given a table of contents in a json format and several pages of a document, your job is to add the physical_index to the table of contents in the json format.
 
     The provided pages contains tags like <physical_index_X> and <physical_index_X> to indicate the physical location of the page X.
@@ -341,7 +341,7 @@ def toc_index_extractor(toc, content, model=None):
     If the section is not in the provided pages, do not add the physical_index to it.
     Directly return the final JSON structure. Do not output anything else."""
 
-    prompt = tob_extractor_prompt + '\nTable of contents:\n' + str(toc) + '\nDocument pages:\n' + content
+    prompt = toc_extractor_prompt + '\nTable of contents:\n' + str(toc) + '\nDocument pages:\n' + content
     response = ChatGPT_API(model=model, prompt=prompt)
     
     data = extract_json(response)
@@ -576,10 +576,11 @@ def add_page_number_to_toc(part, structure, model=None):
     prompt = fill_prompt_seq + f"\n\nCurrent Partial Document:\n{part}\n\nGiven Structure\n{json.dumps(structure, indent=2)}\n"
     current_json_raw = ChatGPT_API(model=model, prompt=prompt)
     
-    # Wrap list in root object for validation
-    data = extract_json(current_json_raw)
-    if isinstance(data, list):
-        data = {'root': data}
+    extracted_data = extract_json(current_json_raw)
+    if isinstance(extracted_data, list):
+        data = {'root': extracted_data}
+    else:
+        data = extracted_data
         
     try:
         parsed_response = AddPageNumberResponse(**data)
