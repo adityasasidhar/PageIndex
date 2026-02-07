@@ -19,11 +19,23 @@ def parse_llm_response(model_cls: Type[T], raw_response: str, logger=None) -> T 
     """
     try:
         data = extract_json(raw_response)
-
-        # normalize common LLM inconsistencies
-        for k, v in data.items():
-            if isinstance(v, str):
-                data[k] = v.strip().lower()
+        normalizable_fields = {
+            'answer', 'start_begin', 'toc_detected', 'completed', 
+            'page_index_given_in_toc', 'start'
+        }
+        
+        # Normalize only specific fields, recursively handle nested structures
+        def normalize_data(obj):
+            if isinstance(obj, dict):
+                return {
+                    k: v.strip().lower() if isinstance(v, str) and k in normalizable_fields else normalize_data(v)
+                    for k, v in obj.items()
+                }
+            elif isinstance(obj, list):
+                return [normalize_data(item) for item in obj]
+            return obj
+        
+        data = normalize_data(data)
 
         return model_cls(**data)
 
@@ -318,7 +330,7 @@ def toc_extractor(page_list, toc_page_list, model):
 
 
 
-def toc_index_extractor(toc, content, model=None):
+def toc_index_extractor(toc, content, model=None, logger=None):
     print('start toc_index_extractor')
     toc_extractor_prompt = """
     You are given a table of contents in a json format and several pages of a document, your job is to add the physical_index to the table of contents in the json format.
@@ -344,21 +356,19 @@ def toc_index_extractor(toc, content, model=None):
     prompt = toc_extractor_prompt + '\nTable of contents:\n' + str(toc) + '\nDocument pages:\n' + content
     response = ChatGPT_API(model=model, prompt=prompt)
     
+    # Normalize response to expected format
     data = extract_json(response)
     if isinstance(data, list):
         data = {'root': data}
     
-    try:
-        parsed_response = TocIndexResponse(**data)
-        # Convert back to list of dicts as expected by downstream code
+    parsed_response = parse_llm_response(TocIndexResponse, json.dumps(data), logger)
+    if parsed_response:
         return [item.model_dump() for item in parsed_response.root]
-    except ValidationError as e:
-        print(f"Validation failed for toc_index_extractor: {e}")
-        return []
+    return []
 
 
 
-def toc_transformer(toc_content, model=None):
+def toc_transformer(toc_content, model=None, logger=None):
     print('start toc_transformer')
     init_prompt = """
     You are given a table of contents, You job is to transform the whole table of content into a JSON format included table_of_contents.
@@ -383,7 +393,7 @@ def toc_transformer(toc_content, model=None):
     last_complete, finish_reason = ChatGPT_API_with_finish_reason(model=model, prompt=prompt)
     if_complete = check_if_toc_transformation_is_complete(toc_content, last_complete, model)
     if if_complete == "yes" and finish_reason == "finished":
-        parsed_response = parse_llm_response(TocTransformerResponse, last_complete)
+        parsed_response = parse_llm_response(TocTransformerResponse, last_complete, logger)
         if parsed_response:
             # Normalize to list of dicts for convert_page_to_int
             data_list = [item.model_dump() for item in parsed_response.table_of_contents]
@@ -416,16 +426,11 @@ def toc_transformer(toc_content, model=None):
         if_complete = check_if_toc_transformation_is_complete(toc_content, last_complete, model)
         
 
-    try:
-        data = extract_json(last_complete)
-        # Ensure data matches model structure
-        parsed_response = TocTransformerResponse(**data)
+    parsed_response = parse_llm_response(TocTransformerResponse, last_complete, logger)
+    if parsed_response:
         data_list = [item.model_dump() for item in parsed_response.table_of_contents]
-        cleaned_response=convert_page_to_int(data_list)
-        return cleaned_response
-    except ValidationError as e:
-        print(f"Validation failed for toc_transformer: {e}")
-        return []
+        return convert_page_to_int(data_list)
+    return []
     
 
 
@@ -550,7 +555,7 @@ def page_list_to_group_text(page_contents, token_lengths, max_tokens=20000, over
     print('divide page_list to groups', len(subsets))
     return subsets
 
-def add_page_number_to_toc(part, structure, model=None):
+def add_page_number_to_toc(part, structure, model=None, logger=None):
     fill_prompt_seq = """
     You are given an JSON structure of a document and a partial part of the document. Your task is to check if the title that is described in the structure is started in the partial given document.
 
@@ -575,18 +580,16 @@ def add_page_number_to_toc(part, structure, model=None):
 
     prompt = fill_prompt_seq + f"\n\nCurrent Partial Document:\n{part}\n\nGiven Structure\n{json.dumps(structure, indent=2)}\n"
     current_json_raw = ChatGPT_API(model=model, prompt=prompt)
-    
     extracted_data = extract_json(current_json_raw)
     if isinstance(extracted_data, list):
         data = {'root': extracted_data}
     else:
         data = extracted_data
-        
-    try:
-        parsed_response = AddPageNumberResponse(**data)
+    
+    parsed_response = parse_llm_response(AddPageNumberResponse, json.dumps(data), logger)
+    if parsed_response:
         json_result = [item.model_dump() for item in parsed_response.root]
-    except ValidationError as e:
-        print(f"Validation failed for add_page_number_to_toc: {e}")
+    else:
         json_result = []
     
     for item in json_result:
@@ -607,8 +610,7 @@ def remove_first_physical_index_section(text):
         return text.replace(match.group(0), '', 1)
     return text
 
-### add verify completeness
-def generate_toc_continue(toc_content, part, model="gpt-4o-2024-11-20"):
+def generate_toc_continue(toc_content, part, model="gpt-4o-2024-11-20", logger=None):
     print('start generate_toc_continue')
     prompt = """
     You are an expert in extracting hierarchical tree structure.
@@ -641,17 +643,16 @@ def generate_toc_continue(toc_content, part, model="gpt-4o-2024-11-20"):
         data = extract_json(response)
         if isinstance(data, list):
             data = {'root': data}
-        try:
-            parsed_response = GenerateTocResponse(**data)
+        
+        parsed_response = parse_llm_response(GenerateTocResponse, json.dumps(data), logger)
+        if parsed_response:
             return [item.model_dump() for item in parsed_response.root]
-        except ValidationError as e:
-            print(f"Validation failed for generate_toc_continue: {e}")
-            return []
+        return []
     else:
         raise Exception(f'finish reason: {finish_reason}')
     
 ### add verify completeness
-def generate_toc_init(part, model=None):
+def generate_toc_init(part, model=None, logger=None):
     print('start generate_toc_init')
     prompt = """
     You are an expert in extracting hierarchical tree structure, your task is to generate the tree structure of the document.
@@ -684,12 +685,11 @@ def generate_toc_init(part, model=None):
         data = extract_json(response)
         if isinstance(data, list):
             data = {'root': data}
-        try:
-            parsed_response = GenerateTocResponse(**data)
+        
+        parsed_response = parse_llm_response(GenerateTocResponse, json.dumps(data), logger)
+        if parsed_response:
             return [item.model_dump() for item in parsed_response.root]
-        except ValidationError as e:
-            print(f"Validation failed for generate_toc_init: {e}")
-            return []
+        return []
     else:
         raise Exception(f'finish reason: {finish_reason}')
 
@@ -703,9 +703,9 @@ def process_no_toc(page_list, start_index=1, model=None, logger=None):
     group_texts = page_list_to_group_text(page_contents, token_lengths)
     logger.info(f'len(group_texts): {len(group_texts)}')
 
-    toc_with_page_number= generate_toc_init(group_texts[0], model)
+    toc_with_page_number= generate_toc_init(group_texts[0], model, logger)
     for group_text in group_texts[1:]:
-        toc_with_page_number_additional = generate_toc_continue(toc_with_page_number, group_text, model)    
+        toc_with_page_number_additional = generate_toc_continue(toc_with_page_number, group_text, model, logger)    
         toc_with_page_number.extend(toc_with_page_number_additional)
     logger.info(f'generate_toc: {toc_with_page_number}')
 
@@ -717,7 +717,7 @@ def process_no_toc(page_list, start_index=1, model=None, logger=None):
 def process_toc_no_page_numbers(toc_content, toc_page_list, page_list,  start_index=1, model=None, logger=None):
     page_contents=[]
     token_lengths=[]
-    toc_content = toc_transformer(toc_content, model)
+    toc_content = toc_transformer(toc_content, model, logger)
     logger.info(f'toc_transformer: {toc_content}')
     for page_index in range(start_index, start_index+len(page_list)):
         page_text = f"<physical_index_{page_index}>\n{page_list[page_index-start_index][0]}\n<physical_index_{page_index}>\n\n"
@@ -729,7 +729,7 @@ def process_toc_no_page_numbers(toc_content, toc_page_list, page_list,  start_in
 
     toc_with_page_number=copy.deepcopy(toc_content)
     for group_text in group_texts:
-        toc_with_page_number = add_page_number_to_toc(group_text, toc_with_page_number, model)
+        toc_with_page_number = add_page_number_to_toc(group_text, toc_with_page_number, model, logger)
     logger.info(f'add_page_number_to_toc: {toc_with_page_number}')
 
     toc_with_page_number = convert_physical_index_to_int(toc_with_page_number)
@@ -740,7 +740,7 @@ def process_toc_no_page_numbers(toc_content, toc_page_list, page_list,  start_in
 
 
 def process_toc_with_page_numbers(toc_content, toc_page_list, page_list, toc_check_page_num=None, model=None, logger=None):
-    toc_with_page_number = toc_transformer(toc_content, model)
+    toc_with_page_number = toc_transformer(toc_content, model, logger)
     logger.info(f'toc_with_page_number: {toc_with_page_number}')
 
     toc_no_page_number = remove_page_number(copy.deepcopy(toc_with_page_number))
@@ -750,7 +750,7 @@ def process_toc_with_page_numbers(toc_content, toc_page_list, page_list, toc_che
     for page_index in range(start_page_index, min(start_page_index + toc_check_page_num, len(page_list))):
         main_content += f"<physical_index_{page_index+1}>\n{page_list[page_index][0]}\n<physical_index_{page_index+1}>\n\n"
 
-    toc_with_physical_index = toc_index_extractor(toc_no_page_number, main_content, model)
+    toc_with_physical_index = toc_index_extractor(toc_no_page_number, main_content, model, logger)
     logger.info(f'toc_with_physical_index: {toc_with_physical_index}')
 
     toc_with_physical_index = convert_physical_index_to_int(toc_with_physical_index)
@@ -776,8 +776,6 @@ def process_toc_with_page_numbers(toc_content, toc_page_list, page_list, toc_che
 def process_none_page_numbers(toc_items, page_list, start_index=1, model=None):
     for i, item in enumerate(toc_items):
         if "physical_index" not in item:
-            # logger.info(f"fix item: {item}")
-            # Find previous physical_index
             prev_physical_index = 0  # Default if no previous item exists
             for j in range(i - 1, -1, -1):
                 if toc_items[j].get('physical_index') is not None:
